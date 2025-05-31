@@ -1,10 +1,12 @@
 hf_configuration:
-  hf_dataset_name: nasa_sp287_example # change this to your desired dataset name
+  hf_dataset_name: nasa_sp287_example_gpt # change this to your desired dataset name
   private: false # change this to true if you want to make the dataset private. it's true by default.
 
 model_list:
-  - model_name: Qwen/Qwen3-30B-A3B
-    provider: fireworks-ai
+  - model_name: gpt-4.1-nano
+    base_url: https://api.openai.com/v1
+    api_key: $OPENAI_API_KEY
+    max_concurrent_requests: 8
 
 pipeline:
   ingestion:
