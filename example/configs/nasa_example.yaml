@@ -1,5 +1,5 @@
 hf_configuration:
-  hf_dataset_name: nasa_sp287_example_gpt # change this to your desired dataset name
+  hf_dataset_name: nasa_sp287_example_gpt_single_shot_only # change this to your desired dataset name
   private: false # change this to true if you want to make the dataset private. it's true by default.
 
 model_list:
@@ -16,6 +16,10 @@ pipeline:
   summarization:
   chunking:
   single_shot_question_generation:
+    run: true
   multi_hop_question_generation:
+    run: false
   lighteval:
+    run: false
   citation_score_filtering:
+    run: false
