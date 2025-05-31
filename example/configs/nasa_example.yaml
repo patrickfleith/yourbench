@@ -1,6 +1,8 @@
+# hf_configuration section header
 hf_configuration:
   hf_dataset_name: nasa_sp287_example_gpt_single_shot_only # change this to your desired dataset name
   private: false # change this to true if you want to make the dataset private. it's true by default.
+  upload_card: true
 
 model_list:
   - model_name: gpt-4.1-nano

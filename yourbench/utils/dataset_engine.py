@@ -6,6 +6,7 @@ from loguru import logger
 from datasets import Dataset, DatasetDict, load_dataset, load_from_disk, concatenate_datasets
 from huggingface_hub import HfApi, whoami
 from huggingface_hub.utils import HFValidationError
+from huggingface_hub import DatasetCardData, DatasetCard
 
 
 class ConfigurationError(Exception):
@@ -219,6 +220,7 @@ def custom_save_dataset(
     subset: Optional[str] = None,
     save_local: bool = True,
     push_to_hub: bool = True,
+    upload_card: bool = None,
 ) -> None:
     """
     Save a dataset subset locally and push it to Hugging Face Hub.
@@ -227,6 +229,10 @@ def custom_save_dataset(
     - If a subset is specified, it will be added to an existing dataset or
       create a new DatasetDict containing that subset.
     - All subsets are saved to the same local_dataset_dir.
+    
+    Args:
+        upload_card: If None, will check config["hf_configuration"]["upload_card"] 
+                    (defaults to True if not specified)
     """
     # In offline mode, force save local and disable push to hub
     if _is_offline_mode():
@@ -344,3 +350,114 @@ def custom_save_dataset(
             config_name=config_name,
         )
         logger.success(f"Dataset successfully pushed to HuggingFace Hub with repo_id='{dataset_repo_name}'")
+
+    if upload_card is None:
+        upload_card = config["hf_configuration"].get("upload_card", True)
+    if upload_card and not _is_offline_mode():
+        upload_dataset_card(config, dataset, subset)
+
+
+def upload_dataset_card(
+    config: Dict[str, Any], 
+    dataset: Dataset | None = None, 
+    subset: str | None = None,
+    template_path: str | None = None
+) -> None:
+    """
+    Generate and upload a dataset card using the Jinja2 template.
+    
+    Args:
+        config: Configuration dictionary containing HF settings
+        dataset: Optional dataset to extract metadata from
+        subset: Optional subset name
+        template_path: Path to the Jinja2 template file
+    """
+    logger.info("Starting dataset card upload process")
+    
+    if _is_offline_mode():
+        logger.warning("Offline mode enabled. Skipping dataset card upload.")
+        return
+    
+    try:
+        # Get dataset repo name
+        dataset_repo_name = _get_full_dataset_repo_name(config)
+        logger.info(f"Uploading card for dataset: {dataset_repo_name}")
+        
+        # Load template
+        if not template_path:
+            # Try to find template in utils directory
+            current_dir = os.path.dirname(__file__)
+            template_path = os.path.join(current_dir, "yourbench_card_template.md")
+        
+        logger.info(f"Loading template from: {template_path}")
+        
+        if not os.path.exists(template_path):
+            logger.error(f"Template file not found: {template_path}")
+            return
+            
+        with open(template_path, "r", encoding="utf-8") as f:
+            template_str = f.read()
+            
+        logger.debug(f"Template loaded successfully, length: {len(template_str)} characters")
+        
+        # Create card data
+        hf_config = config.get("hf_configuration", {})
+        card_data = DatasetCardData(
+            pretty_name=hf_config.get("pretty_name", dataset_repo_name.split("/")[-1].replace("-", " ").title()),
+            language=hf_config.get("language", "en"),
+            license=hf_config.get("license", "apache-2.0"),
+        )
+        logger.info(f"Created card data with pretty_name: {card_data.pretty_name}")
+        
+        # Prepare template variables
+        template_vars = {
+            "pretty_name": card_data.pretty_name,
+        }
+        
+        # Add dataset-specific variables if dataset provided
+        if dataset:
+            logger.info("Adding dataset-specific variables to template")
+            template_vars.update({
+                "n_rows": len(dataset),
+                "n_cols": len(dataset.features),
+                "dtypes": {k: str(v.dtype) if hasattr(v, "dtype") else "string" 
+                          for k, v in dataset.features.items()}
+            })
+            logger.debug(f"Dataset has {template_vars['n_rows']} rows and {template_vars['n_cols']} columns")
+        
+        # Add subset count if we can determine it
+        try:
+            # Try to load existing dataset to count subsets
+            existing_dataset = custom_load_dataset(config=config, subset=None)
+            if isinstance(existing_dataset, DatasetDict):
+                template_vars["n_subsets"] = len(existing_dataset)
+                logger.info(f"Found {template_vars['n_subsets']} subsets in existing dataset")
+        except Exception as e:
+            logger.debug(f"Could not determine subset count: {e}")
+        
+        # Add footer
+        template_vars["footer"] = hf_config.get("footer", "*(auto-generated dataset card)*")
+        
+        logger.info("Rendering dataset card from template")
+        logger.debug(f"Template variables: {list(template_vars.keys())}")
+        
+        # Render card
+        card = DatasetCard.from_template(
+            card_data=card_data,
+            template_str=template_str,
+            **template_vars
+        )
+        
+        logger.info("Template rendered successfully")
+        logger.debug(f"Rendered card content length: {len(str(card))} characters")
+        
+        # Push to hub
+        logger.info(f"Pushing dataset card to hub: {dataset_repo_name}")
+        token = hf_config.get("token") or os.getenv("HF_TOKEN", None)
+        card.push_to_hub(dataset_repo_name, token=token)
+        
+        logger.success(f"Dataset card successfully uploaded to: https://huggingface.co/datasets/{dataset_repo_name}")
+        
+    except Exception as e:
+        logger.error(f"Failed to upload dataset card: {e}")
+        logger.exception("Full traceback:")
