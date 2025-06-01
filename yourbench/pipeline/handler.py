@@ -157,6 +157,14 @@ def run_pipeline(
 
     # Check for unrecognized stages in config
     _check_for_unrecognized_stages(pipeline_config)
+    
+    # Upload the final dataset card with complete information
+    try:
+        from yourbench.utils.dataset_engine import upload_final_dataset_card
+        logger.info("Uploading final dataset card with all pipeline stages information")
+        upload_final_dataset_card(config)
+    except Exception as e:
+        logger.warning(f"Failed to upload final dataset card: {e}")
 
     # Optionally plot pipeline stage timings
     if plot_stage_timing or debug:
