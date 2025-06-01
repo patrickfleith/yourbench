@@ -1,6 +1,6 @@
 ---
 {{ card_data }}
-{{ dataset_info }}
+{{ config_data }}
 ---
 
 # {{ pretty_name }}
