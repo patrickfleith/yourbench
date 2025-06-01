@@ -4,9 +4,8 @@ from typing import Any, Dict, Optional
 from loguru import logger
 
 from datasets import Dataset, DatasetDict, load_dataset, load_from_disk, concatenate_datasets
-from huggingface_hub import HfApi, whoami
+from huggingface_hub import HfApi, whoami, DatasetCardData, DatasetCard
 from huggingface_hub.utils import HFValidationError
-from huggingface_hub import DatasetCardData, DatasetCard
 
 
 class ConfigurationError(Exception):
@@ -18,6 +17,126 @@ class ConfigurationError(Exception):
 def _is_offline_mode() -> bool:
     """Check if offline mode is enabled via environment variable."""
     return os.environ.get("HF_HUB_OFFLINE", "0").lower() in ("1", "true", "yes")
+
+
+def extract_readme_metadata(repo_id: str, token: Optional[str] = None) -> str:
+    """Extracts the metadata from the README.md file of the dataset repository.
+
+    We have to download the previous README.md file in the repo, extract the metadata from it.
+
+    Args:
+        repo_id: The ID of the repository to push to, from the `push_to_hub` method.
+        token: The token to authenticate with the Hugging Face Hub, from the `push_to_hub` method.
+
+    Returns:
+        The metadata extracted from the README.md file of the dataset repository as a str.
+    """
+    try:
+        from pathlib import Path
+        import re
+        import yaml
+        from huggingface_hub.file_download import hf_hub_download
+        
+        readme_path = Path(
+            hf_hub_download(repo_id, "README.md", repo_type="dataset", token=token)
+        )
+        # Extract the content between the '---' markers
+        metadata_match = re.findall(r"---\n(.*?)\n---", readme_path.read_text(), re.DOTALL)
+        
+        if not metadata_match:
+            logger.debug("No YAML metadata found in the README.md")
+            return ""
+        
+        return metadata_match[0]
+
+    except Exception as e:
+        logger.debug(f"Failed to extract metadata from README.md: {e}")
+        return ""
+
+
+def extract_dataset_info(repo_id: str, token: Optional[str] = None) -> str:
+    """
+    Extract dataset_info section from README metadata.
+    
+    Args:
+        repo_id: The dataset repository ID
+        token: Optional HuggingFace token for authentication
+        
+    Returns:
+        The dataset_info section as a string, or empty string if not found
+    """       
+    readme_metadata = extract_readme_metadata(repo_id=repo_id, token=token)
+    if not readme_metadata:
+        return ""
+    
+    section_prefix = "dataset_info:"
+    if section_prefix not in readme_metadata:
+        return ""
+    
+    try:
+        # Extract the part after `dataset_info:` prefix
+        config_data = section_prefix + readme_metadata.split(section_prefix)[1]
+        return config_data
+    except IndexError:
+        logger.debug("Failed to extract dataset_info section from metadata")
+        return ""
+
+
+def _serialize_config_for_card(config: Dict[str, Any]) -> str:
+    """
+    Sanitize and serialize pipeline config to YAML for inclusion in dataset card.
+    """
+    try:
+        import yaml
+    except ImportError:
+        raise ImportError("PyYAML is required for config serialization")
+    from copy import deepcopy
+
+    def _sanitize(obj, key=None):
+        if isinstance(obj, dict):
+            return {k: _sanitize(v, k) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_sanitize(v) for v in obj]
+        if isinstance(obj, str):
+            # Mask only api_key arguments
+            if key and "api_key" in key.lower():
+                return "$API_KEY"
+            # Keep placeholders
+            if obj.startswith("$"):
+                return obj
+            # Mask OpenAI API keys
+            if obj.startswith("sk-"):
+                return "$OPENAI_API_KEY"
+            # Mask HuggingFace tokens
+            if obj.startswith("hf_"):
+                return "$HF_TOKEN"
+            return obj
+
+    sanitized = _sanitize(deepcopy(config))
+    return yaml.safe_dump(sanitized, sort_keys=False, default_flow_style=False)
+
+
+def _get_pipeline_subset_info(config: Dict[str, Any]) -> str:
+    """
+    Generate markdown list of pipeline subsets based on config stages.
+    """
+    mapping = {
+        "ingestion": "Read raw source documents, convert them to normalized markdown (optionally via LLM), and save for downstream steps",
+        "upload_ingest_to_hub": "Package and push ingested markdown dataset to the Hugging Face Hub or save locally with standardized fields",
+        "summarization": "Perform hierarchical summarization: chunk-level LLM summaries followed by combine-stage reduction",
+        "chunking": "Split texts into token-based single-hop and multi-hop chunks",
+        "single_shot_question_generation": "Generate standalone question-answer pairs per chunk using LLM",
+        "multi_hop_question_generation": "Generate multi-hop QA pairs requiring reasoning across multiple chunks",
+        "lighteval": "Merge QA pairs and chunk metadata into a lighteval compatible dataset for quick model-based scoring",
+        "citation_score_filtering": "Compute overlap-based citation scores and filter QA pairs accordingly",
+    }
+    pipeline = config.get("pipeline", {})
+    lines = []
+    for stage, cfg in pipeline.items():
+        if isinstance(cfg, dict) and cfg.get("run"):
+            desc = mapping.get(stage, stage.replace("_", " ").title())
+            lines.append(f"- **{stage}**: {desc}")
+    return "\n".join(lines)
 
 
 def _safe_get_organization(config: Dict, dataset_name: str, organization: str, token: str) -> str:
@@ -220,7 +339,6 @@ def custom_save_dataset(
     subset: Optional[str] = None,
     save_local: bool = True,
     push_to_hub: bool = True,
-    upload_card: bool = None,
 ) -> None:
     """
     Save a dataset subset locally and push it to Hugging Face Hub.
@@ -229,10 +347,6 @@ def custom_save_dataset(
     - If a subset is specified, it will be added to an existing dataset or
       create a new DatasetDict containing that subset.
     - All subsets are saved to the same local_dataset_dir.
-    
-    Args:
-        upload_card: If None, will check config["hf_configuration"]["upload_card"] 
-                    (defaults to True if not specified)
     """
     # In offline mode, force save local and disable push to hub
     if _is_offline_mode():
@@ -349,28 +463,27 @@ def custom_save_dataset(
             private=config["hf_configuration"].get("private", True),
             config_name=config_name,
         )
-        logger.success(f"Dataset successfully pushed to HuggingFace Hub with repo_id='{dataset_repo_name}'")
-
-    if upload_card is None:
-        upload_card = config["hf_configuration"].get("upload_card", True)
-    if upload_card and not _is_offline_mode():
-        upload_dataset_card(config, dataset, subset)
+        logger.success(f"Dataset successfully pushed to HuggingFace Hub with repo_id='{dataset_repo_name}' and config '{config_name}'")
 
 
 def upload_dataset_card(
     config: Dict[str, Any], 
     dataset: Dataset | None = None, 
-    subset: str | None = None,
     template_path: str | None = None
 ) -> None:
     """
-    Generate and upload a dataset card using the Jinja2 template.
+    Generate and upload a comprehensive dataset card with information about all pipeline subsets.
+    
+    This function creates a scientifically rigorous dataset card that includes:
+    1. Pipeline subset descriptions based on enabled stages
+    2. Full sanitized configuration for reproducibility
+    3. YourBench version and other metadata
+    4. Preserved dataset_info from the existing card for proper configuration display
     
     Args:
         config: Configuration dictionary containing HF settings
-        dataset: Optional dataset to extract metadata from
-        subset: Optional subset name
-        template_path: Path to the Jinja2 template file
+        dataset: Optional dataset to extract metadata from (not required)
+        template_path: Optional custom template path
     """
     logger.info("Starting dataset card upload process")
     
@@ -400,48 +513,53 @@ def upload_dataset_card(
             
         logger.debug(f"Template loaded successfully, length: {len(template_str)} characters")
         
-        # Create card data
+        # Get HF token
         hf_config = config.get("hf_configuration", {})
-        card_data = DatasetCardData(
-            pretty_name=hf_config.get("pretty_name", dataset_repo_name.split("/")[-1].replace("-", " ").title()),
-            language=hf_config.get("language", "en"),
-            license=hf_config.get("license", "apache-2.0"),
-        )
+        token = hf_config.get("token") or os.getenv("HF_TOKEN", None)
+        
+        # Extract dataset_info section from existing README if available
+        config_data = extract_dataset_info(repo_id=dataset_repo_name, token=token)
+        logger.info(f"Extracted dataset_info section, length: {len(config_data) if config_data else 0} characters")
+        
+        # Prepare card data
+        card_data_kwargs = {
+            "pretty_name": hf_config.get("pretty_name", dataset_repo_name.split("/")[-1].replace("-", " ").title())
+        }
+        
+        # Only add language and license if explicitly provided by user
+        if "language" in hf_config:
+            card_data_kwargs["language"] = hf_config["language"]
+            
+        if "license" in hf_config:
+            card_data_kwargs["license"] = hf_config["license"]
+        
+        # Create DatasetCardData with our metadata
+        card_data = DatasetCardData(**card_data_kwargs)
         logger.info(f"Created card data with pretty_name: {card_data.pretty_name}")
+        
+        # Get YourBench version
+        from importlib.metadata import version, PackageNotFoundError
+        
+        try:
+            version_str = version("yourbench")
+        except PackageNotFoundError:
+            # Fallback for development installs
+            version_str = "0.0.0"  # or "dev" if you prefer
         
         # Prepare template variables
         template_vars = {
             "pretty_name": card_data.pretty_name,
+            "yourbench_version": version_str,
+            "config_yaml": _serialize_config_for_card(config),
+            "pipeline_subsets": _get_pipeline_subset_info(config),
+            "config_data": config_data,  # Use the extracted dataset_info section
+            "footer": hf_config.get("footer", "*(auto-generated dataset card)*")
         }
-        
-        # Add dataset-specific variables if dataset provided
-        if dataset:
-            logger.info("Adding dataset-specific variables to template")
-            template_vars.update({
-                "n_rows": len(dataset),
-                "n_cols": len(dataset.features),
-                "dtypes": {k: str(v.dtype) if hasattr(v, "dtype") else "string" 
-                          for k, v in dataset.features.items()}
-            })
-            logger.debug(f"Dataset has {template_vars['n_rows']} rows and {template_vars['n_cols']} columns")
-        
-        # Add subset count if we can determine it
-        try:
-            # Try to load existing dataset to count subsets
-            existing_dataset = custom_load_dataset(config=config, subset=None)
-            if isinstance(existing_dataset, DatasetDict):
-                template_vars["n_subsets"] = len(existing_dataset)
-                logger.info(f"Found {template_vars['n_subsets']} subsets in existing dataset")
-        except Exception as e:
-            logger.debug(f"Could not determine subset count: {e}")
-        
-        # Add footer
-        template_vars["footer"] = hf_config.get("footer", "*(auto-generated dataset card)*")
         
         logger.info("Rendering dataset card from template")
         logger.debug(f"Template variables: {list(template_vars.keys())}")
         
-        # Render card
+        # Render card with our template and variables 
         card = DatasetCard.from_template(
             card_data=card_data,
             template_str=template_str,
@@ -453,7 +571,6 @@ def upload_dataset_card(
         
         # Push to hub
         logger.info(f"Pushing dataset card to hub: {dataset_repo_name}")
-        token = hf_config.get("token") or os.getenv("HF_TOKEN", None)
         card.push_to_hub(dataset_repo_name, token=token)
         
         logger.success(f"Dataset card successfully uploaded to: https://huggingface.co/datasets/{dataset_repo_name}")
@@ -461,3 +578,32 @@ def upload_dataset_card(
     except Exception as e:
         logger.error(f"Failed to upload dataset card: {e}")
         logger.exception("Full traceback:")
+
+
+def upload_final_dataset_card(config: Dict[str, Any]) -> None:
+    """
+    Generate and upload a final dataset card at the end of the pipeline.
+    This function should be called at the end of the pipeline when all subsets are available.
+    
+    Args:
+        config: Pipeline configuration dictionary
+    """
+    try:
+        # Check if card upload is enabled in config
+        hf_config = config.get("hf_configuration", {})
+        upload_card = hf_config.get("upload_card", True)
+        
+        if not upload_card:
+            logger.info("Dataset card upload disabled in configuration. Skipping final card upload.")
+            return
+            
+        if _is_offline_mode():
+            logger.info("Offline mode enabled. Skipping final dataset card upload.")
+            return
+            
+        logger.info("Uploading final dataset card with complete pipeline information")
+        upload_dataset_card(config)
+        
+    except Exception as e:
+        logger.error(f"Error uploading final dataset card: {e}")
+        # Don't re-raise the exception to avoid pipeline failure
