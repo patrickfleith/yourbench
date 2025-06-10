@@ -1,6 +1,6 @@
 # hf_configuration section header
 hf_configuration:
-  hf_dataset_name: yourbench_nasa_sp287-test-7 # change this to your desired dataset name
+  hf_dataset_name: yourbench_nasa_sp287_2 # change this to your desired dataset name
   private: false # change this to true if you want to make the dataset private. it's true by default.
   upload_card: true
 
@@ -15,15 +15,6 @@ pipeline:
     source_documents_dir: example/data/nasa_raw
     output_dir: example/data/nasa_processed
   upload_ingest_to_hub:
-    run: true
   summarization:
-    run: true
   chunking:
   single_shot_question_generation:
-    run: true
-  multi_hop_question_generation:
-    run: false
-  lighteval:
-    run: false
-  citation_score_filtering:
-    run: false
