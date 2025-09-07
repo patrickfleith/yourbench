@@ -744,24 +744,43 @@ class YourbenchConfig(BaseModel):
         logger.info(f"Configuration saved to {path}")
 
     @classmethod
+    def _load_yaml_file(cls, path: Union[str, Path]) -> dict[str, Any]:
+        """Load and parse YAML file with error handling."""
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"Configuration file not found: {path}")
+        
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return yaml.safe_load(fh) or {}
+        except yaml.YAMLError as e:
+            raise ValueError(f"Invalid YAML in {path}: {e}") from e
+    
+
+    @classmethod
+    def _apply_legacy_compatibility(cls, data: dict[str, Any]) -> dict[str, Any]:
+        """
+        Apply backward compatibility transformations to YAML configuration data.
+        
+        This method handles field name migrations and structural changes needed
+        to support older configuration file formats while maintaining compatibility
+        with the current YourbenchConfig schema.
+        
+        Current transformations:
+        - Converts legacy 'models' field to 'model_list' for consistency
+        """
+        if "models" in data and "model_list" not in data:
+            data["model_list"] = data.pop("models")
+            logger.info("Converted legacy 'models' field to 'model_list'")
+        return data
+
+    @classmethod
     def from_yaml(cls, path: Union[str, Path]) -> "YourbenchConfig":
         """
         Load YAML config with proper validation and legacy support.
         """
-        path = Path(path)
-        if not path.exists():
-            raise FileNotFoundError(f"Configuration file not found: {path}")
-
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                data = yaml.safe_load(fh) or {}
-        except yaml.YAMLError as e:
-            raise ValueError(f"Invalid YAML in {path}: {e}") from e
-
-        # Legacy compatibility: handle both 'models' and 'model_list'
-        if "models" in data and "model_list" not in data:
-            data["model_list"] = data.pop("models")
-            logger.info("Converted legacy 'models' field to 'model_list'")
+        raw_data = cls._load_yaml_file(path)
+        data = cls._apply_legacy_compatibility(raw_data)
 
         # Handle nested pipeline configuration properly
         pipeline_data = data.get("pipeline", {})
